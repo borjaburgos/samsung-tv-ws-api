@@ -1,24 +1,10 @@
 """
 SamsungTVWS - Samsung Smart TV WS API wrapper
 
-Copyright (C) 2019 Xchwarze
+Copyright (C) 2019 DSR! <xchwarze@gmail.com>
 Copyright (C) 2021 Matthew Garrett <mjg59@srcf.ucam.org>
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
-
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor,
-    Boston, MA  02110-1335  USA
-
+SPDX-License-Identifier: GPL-2.0
 """
 from datetime import datetime
 import json
@@ -27,7 +13,6 @@ import random
 import socket
 from typing import Any, Dict, List, Optional, Union
 import uuid
-import time
 
 import websocket
 
@@ -112,52 +97,6 @@ class SamsungTVArt(SamsungTVWSConnection):
         assert self.connection
         event: Optional[str] = None
         sub_event: Optional[str] = None
-        while event != wait_for_event:
-            data = self.connection.recv()
-            response = helper.process_api_response(data)
-            event = response.get("event", "*")
-            assert event
-            self._websocket_event(event, response)
-            if event == wait_for_event and wait_for_sub_event:
-                # Check sub event, reset event if it doesn't match
-                data = json.loads(response["data"])
-                sub_event = data.get("event", "*")
-                if sub_event == "error":
-                    raise exceptions.ResponseError(
-                        f"`{request_data['request']}` request failed "
-                        f"with error number {data['error_code']}"
-                    )
-                if sub_event != wait_for_sub_event:
-                    event = None
-
-        return response
-
-    def _send_art_legacy(
-        self,
-        request_data: Dict[str, Any],
-        file,
-        wait_for_event: Optional[str] = None,
-        wait_for_sub_event: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-
-
-        payload = bytearray()
-        header = bytes(ArtChannelEmitCommand.art_app_request(request_data).get_payload(), 'utf-8')
-        payload.extend(len(header).to_bytes(2, "big"))
-        payload.extend(header)
-        payload.extend(file)
-        _LOGGING.debug("SamsungTVWS websocket command: %s", payload)
-        
-        self.open()
-        self.connection.send(payload, websocket.ABNF.OPCODE_BINARY)
-
-        if not wait_for_event:
-            return None
-
-        assert self.connection
-        event: Optional[str] = None
-        sub_event: Optional[str] = None
-
         while event != wait_for_event:
             data = self.connection.recv()
             response = helper.process_api_response(data)
@@ -268,78 +207,63 @@ class SamsungTVArt(SamsungTVWSConnection):
         if date is None:
             date = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
 
-        try:
-            response = self._send_art_request(
-                {
-                    "request": "send_image",
-                    "file_type": file_type,
-                    "conn_info": {
-                        "d2d_mode": "socket",
-                        "connection_id": random.randrange(4 * 1024 * 1024 * 1024),
-                        "id": self.art_uuid,
-                    },
-                    "image_date": date,
-                    "matte_id": matte,
-                    "file_size": file_size,
+        response = self._send_art_request(
+            {
+                "request": "send_image",
+                "file_type": file_type,
+                "conn_info": {
+                    "d2d_mode": "socket",
+                    "connection_id": random.randrange(4 * 1024 * 1024 * 1024),
+                    "id": self.art_uuid,
                 },
-                wait_for_event=D2D_SERVICE_MESSAGE_EVENT,
-                wait_for_sub_event="ready_to_use",
-            )
+                "image_date": date,
+                "matte_id": matte,
+                "file_size": file_size,
+            },
+            wait_for_event=D2D_SERVICE_MESSAGE_EVENT,
+            wait_for_sub_event="ready_to_use",
+        )
+        assert response
+        data = json.loads(response["data"])
+        conn_info = json.loads(data["conn_info"])
 
-            assert response
-            data = json.loads(response["data"])
-            conn_info = json.loads(data["conn_info"])
+        header = json.dumps(
+            {
+                "num": 0,
+                "total": 1,
+                "fileLength": file_size,
+                "fileName": "dummy",
+                "fileType": file_type,
+                "secKey": conn_info["key"],
+                "version": "0.0.1",
+            }
+        )
 
-            header = json.dumps(
-                {
-                    "num": 0,
-                    "total": 1,
-                    "fileLength": file_size,
-                    "fileName": "dummy",
-                    "fileType": file_type,
-                    "secKey": conn_info["key"],
-                    "version": "0.0.1",
-                }
-            )
+        art_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        art_socket.connect((conn_info["ip"], int(conn_info["port"])))
+        art_socket.send(len(header).to_bytes(4, "big"))
+        art_socket.send(header.encode("ascii"))
+        art_socket.send(file)
 
-            art_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            art_socket.connect((conn_info["ip"], int(conn_info["port"])))
-            art_socket.send(len(header).to_bytes(4, "big"))
-            art_socket.send(header.encode("ascii"))
-            art_socket.send(file)
+        wait_for_sub_event = "image_added"
+        wait_for_event = "d2d_service_message"
 
-            wait_for_sub_event = "image_added"
-            wait_for_event = "d2d_service_message"
+        assert self.connection
+        event: Optional[str] = None
+        sub_event: Optional[str] = None
 
-            assert self.connection
-            event: Optional[str] = None
-            sub_event: Optional[str] = None
-
-            while event != wait_for_event:
-                data = self.connection.recv()
-                response = helper.process_api_response(data)
-                event = response.get("event", "*")
-                assert event
-                self._websocket_event(event, response)
-                if event == wait_for_event and wait_for_sub_event:
-                    # Check sub event, reset event if it doesn't match
-                    data = json.loads(response["data"])
-                    sub_event = data.get("event", "*")
-                    if sub_event != wait_for_sub_event:
-                        event = None
-
-        except exceptions.ResponseError:
-            response = self._send_art_legacy(
-                {
-                    "request": "send_image",
-                    "file_type": file_type,
-                    "matte_id": matte,
-                    "id": self.art_uuid
-                },
-                file=file,
-                wait_for_event=D2D_SERVICE_MESSAGE_EVENT,
-                wait_for_sub_event="image_added"
-            )
+        while event != wait_for_event:
+            data = self.connection.recv()
+            response = helper.process_api_response(data)
+            event = response.get("event", "*")
+            assert event
+            self._websocket_event(event, response)
+            if event == wait_for_event and wait_for_sub_event:
+                # Check sub event, reset event if it doesn't match
+                data = json.loads(response["data"])
+                sub_event = data.get("event", "*")
+                if sub_event != wait_for_sub_event:
+                    event = None
 
         data = json.loads(response["data"])
 
@@ -414,10 +338,7 @@ class SamsungTVArt(SamsungTVWSConnection):
         assert response
         data = json.loads(response["data"])
 
-        if "matte_type_list" in data:
-            return json.loads(data["matte_type_list"])
-        elif "matte_list" in data:
-            return json.loads(data["matte_list"])
+        return json.loads(data["matte_type_list"])
 
     def change_matte(self, content_id, matte_id):
         self._send_art_request(
